@@ -6,7 +6,8 @@ import time
 from datetime import datetime, timezone
 
 from .barrier_store import BarrierMeta, BarrierStore
-from .models import BarrierView, GroupProgress
+from .handoff_store import HandoffRecord
+from .models import BarrierView, GroupProgress, HandoffView
 
 # 不可再变的终态：达标、截止、主动取消
 SETTLED_STATUSES = frozenset({"reached", "expired", "cancelled"})
@@ -177,6 +178,30 @@ def build_view_from_snapshot(barrier_id: str, snap: dict) -> BarrierView:
         **common,
         status=snap["view_status"],
         checked_count=len(snap["checked_in"]),
+    )
+
+
+def build_handoff_view(record: HandoffRecord) -> HandoffView:
+    """把交接单存储记录组装为对外视图。
+
+    租约字段（owner/fence/leased_at/expires_at）仅在 ``leased`` 状态出现：
+    空闲或租约到期后对外不暴露上一任持有者的失效凭证；完成单只暴露
+    completed_at。快照 quorum/frozen_at 在创建时自屏障复制，任何状态下都不再
+    回读屏障数据，因此屏障回收后视图依然完整。
+    """
+    leased = record.status == "leased"
+    completed = record.status == "completed"
+    return HandoffView(
+        handoff_id=record.handoff_id,
+        barrier_id=record.barrier_id,
+        status=record.status,
+        quorum=record.quorum,
+        frozen_at=_dt(record.frozen_at),
+        owner=record.owner if leased else None,
+        fence=record.fence if leased else None,
+        leased_at=_dt(record.leased_at) if leased and record.leased_at else None,
+        expires_at=_dt(record.expires_at) if leased and record.expires_at else None,
+        completed_at=_dt(record.completed_at) if completed and record.completed_at else None,
     )
 
 

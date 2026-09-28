@@ -26,6 +26,9 @@ services:
       # deadline_extended/participant_replaced 四种唤醒消息
       BARRIER_POLL_INTERVAL_S: "0.5"
       BARRIER_MAX_WAIT_S: "3600"
+      # 达标结果交接单（/handoffs）的认领租约时长（秒，默认 30）：
+      # 租约到期可被他人接管，fence 单调递增；交接单本身无 TTL，独立持久保存
+      HANDOFF_LEASE_S: "30"
     ports:
       - "8000:8000"
     depends_on:

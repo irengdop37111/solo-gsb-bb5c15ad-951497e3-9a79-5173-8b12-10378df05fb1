@@ -358,3 +358,118 @@ class BarrierEventsPage(BaseModel):
     next_cursor: int = Field(
         description="下一页游标（本页最大 seq）；以其为 cursor 继续查询，无新事件时与入参 cursor 相同"
     )
+
+
+# ---------------------------------------------------------------------------
+# 达标结果交接单 handoff
+# ---------------------------------------------------------------------------
+
+
+class CreateHandoffRequest(BaseModel):
+    barrier_id: str = Field(
+        ..., min_length=1, description="已达标屏障的 id；仅 reached 屏障可建立交接单"
+    )
+
+    @model_validator(mode="after")
+    def _validate(self) -> "CreateHandoffRequest":
+        bid = self.barrier_id.strip()
+        if not bid:
+            raise ValueError("barrier_id 不得为空白字符串")
+        self.barrier_id = bid
+        return self
+
+
+class ClaimRequest(BaseModel):
+    owner: str = Field(
+        ...,
+        min_length=1,
+        description="认领者标识（去首尾空白后非空）；租约期内凭 owner + fence 操作",
+    )
+
+    @model_validator(mode="after")
+    def _validate(self) -> "ClaimRequest":
+        owner = self.owner.strip()
+        if not owner:
+            raise ValueError("owner 不得为空白字符串")
+        self.owner = owner
+        return self
+
+
+class RenewRequest(BaseModel):
+    owner: str = Field(..., min_length=1, description="当前租约持有者标识")
+    fence: int = Field(
+        ...,
+        ge=1,
+        description="认领时获得的单调递增栅栏令牌；被到期接管后旧 fence 立即失效",
+    )
+
+    @model_validator(mode="after")
+    def _validate(self) -> "RenewRequest":
+        owner = self.owner.strip()
+        if not owner:
+            raise ValueError("owner 不得为空白字符串")
+        self.owner = owner
+        return self
+
+
+class CompleteRequest(BaseModel):
+    owner: str = Field(..., min_length=1, description="当前租约持有者标识")
+    fence: int = Field(..., ge=1, description="认领时获得的栅栏令牌")
+
+    @model_validator(mode="after")
+    def _validate(self) -> "CompleteRequest":
+        owner = self.owner.strip()
+        if not owner:
+            raise ValueError("owner 不得为空白字符串")
+        self.owner = owner
+        return self
+
+
+class HandoffView(BaseModel):
+    handoff_id: str
+    barrier_id: str = Field(description="来源屏障 id；屏障回收后本单仍独立保存")
+    status: str = Field(
+        description="idle（空闲可认领：从未认领或租约已到期）| leased（租约有效）| completed（已完成终态）"
+    )
+    # 自屏障达标冻结快照独立复制的结果，交接单生命周期内永不改写
+    quorum: list[str] = Field(description="达标成员快照（创建时自屏障 frozen 复制）")
+    frozen_at: datetime = Field(description="屏障达标冻结时刻（UTC，自 frozen 复制）")
+    # 租约信息：仅 leased 状态出现；idle 不返回上一任持有者的失效凭证
+    owner: str | None = Field(default=None, description="当前租约持有者；idle/completed 为 null")
+    fence: int | None = Field(
+        default=None,
+        description="当前租约的单调递增栅栏令牌；每次到期接管 +1；idle/completed 为 null",
+    )
+    leased_at: datetime | None = None
+    expires_at: datetime | None = Field(
+        default=None, description="租约到期时刻（UTC，以 Redis 时间裁决）"
+    )
+    completed_at: datetime | None = Field(
+        default=None, description="完成时刻（UTC，仅 completed）"
+    )
+
+
+class ClaimResponse(BaseModel):
+    handoff_id: str
+    status: str = Field(description="leased（认领 / 到期接管成功）")
+    owner: str
+    fence: int = Field(description="本次认领的栅栏令牌；到期接管时严格大于上一任")
+    leased_at: datetime
+    expires_at: datetime
+
+
+class RenewResponse(BaseModel):
+    handoff_id: str
+    status: str = Field(description="leased（续租成功）")
+    owner: str
+    fence: int = Field(description="续租不更换持有者，fence 保持不变")
+    leased_at: datetime
+    expires_at: datetime = Field(description="续租后新的到期时刻（UTC）")
+
+
+class CompleteHandoffResponse(BaseModel):
+    handoff_id: str
+    status: str = Field(description="completed（本次完成；终态永久拒绝再次认领）")
+    owner: str
+    fence: int
+    completed_at: datetime
