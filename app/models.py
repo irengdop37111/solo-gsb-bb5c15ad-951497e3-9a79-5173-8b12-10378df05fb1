@@ -358,3 +358,94 @@ class BarrierEventsPage(BaseModel):
     next_cursor: int = Field(
         description="下一页游标（本页最大 seq）；以其为 cursor 继续查询，无新事件时与入参 cursor 相同"
     )
+
+
+# ---------------------------------------------------------------------------
+# 达标结果交接 Handoff
+# ---------------------------------------------------------------------------
+
+
+class CreateHandoffRequest(BaseModel):
+    barrier_id: str = Field(
+        ..., min_length=1, description="已达标屏障的 id；只有 reached 状态的屏障才能建立交接单"
+    )
+
+    @model_validator(mode="after")
+    def _validate(self) -> "CreateHandoffRequest":
+        bid = self.barrier_id.strip()
+        if not bid:
+            raise ValueError("barrier_id 不得为空白字符串")
+        self.barrier_id = bid
+        return self
+
+
+class HandoffClaimRequest(BaseModel):
+    owner: str = Field(
+        ..., min_length=1, description="认领者标识（worker / 进程 id）；首尾空白会被去除"
+    )
+
+    @model_validator(mode="after")
+    def _validate(self) -> "HandoffClaimRequest":
+        owner = self.owner.strip()
+        if not owner:
+            raise ValueError("owner 不得为空白字符串")
+        self.owner = owner
+        return self
+
+
+class HandoffRenewRequest(BaseModel):
+    owner: str = Field(..., min_length=1, description="当前持有的认领者标识")
+    fence: int = Field(
+        ..., ge=1, description="认领（或接管）时返回的单调递增 fence 凭证"
+    )
+
+    @model_validator(mode="after")
+    def _validate(self) -> "HandoffRenewRequest":
+        owner = self.owner.strip()
+        if not owner:
+            raise ValueError("owner 不得为空白字符串")
+        self.owner = owner
+        return self
+
+
+class HandoffCompleteRequest(BaseModel):
+    owner: str = Field(..., min_length=1, description="当前持有的认领者标识")
+    fence: int = Field(..., ge=1, description="认领（或接管）时返回的单调递增 fence 凭证")
+
+    @model_validator(mode="after")
+    def _validate(self) -> "HandoffCompleteRequest":
+        owner = self.owner.strip()
+        if not owner:
+            raise ValueError("owner 不得为空白字符串")
+        self.owner = owner
+        return self
+
+
+class HandoffView(BaseModel):
+    handoff_id: str
+    barrier_id: str
+    # idle（从未认领）| active（当前租约有效）| expired（租约到期，等待接管）
+    # | completed（已完成，终态，永久拒绝再次认领）
+    status: str
+    # 从达标屏障复制、永不改写的快照
+    quorum: list[str]
+    frozen_at: datetime
+    created_at: datetime
+    # 最近一次认领 / 接管的凭证；从未认领时为 null。租约到期后字段保留，
+    # 但 lease_active=false，持有者已失去执行权，须被新认领接管。
+    owner: str | None = None
+    fence: int | None = None
+    lease_expires_at: datetime | None = None
+    # 以 Redis 时间裁决：当前租约是否仍在有效期内
+    lease_active: bool = False
+    # 完成终态（仅 completed）
+    completed_at: datetime | None = None
+
+
+class CreateHandoffResponse(HandoffView):
+    replayed: bool = Field(
+        description=(
+            "false 表示本次为该屏障首次建立交接单（201）；"
+            "true 表示同一屏障重复创建，原样返回既有交接单（200）"
+        )
+    )

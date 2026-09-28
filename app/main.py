@@ -11,6 +11,14 @@
   GET    /barriers/{bid}/wait               阻塞等待达标 / 取消 / 截止
   GET    /barriers/{bid}/events             审计事件（报到 + 替补，cursor/limit 分页）
 
+达标结果交接：
+  POST   /handoffs                          仅为已达标屏障建立交接单（复制 quorum/frozen_at，
+                                            同屏障幂等；不存在 404、未达标 409）
+  GET    /handoffs/{hid}                    查询交接单快照、状态与租约
+  POST   /handoffs/{hid}/claim              空闲或租约到期可认领，返回单调递增 fence 与到期时间
+  POST   /handoffs/{hid}/renew              续租（须携带 owner + fence 且租约仍有效）
+  POST   /handoffs/{hid}/complete           完成（凭证 + 有效租约；终态永久拒绝再次认领）
+
 交互文档：GET /docs（Swagger UI）
 """
 
@@ -20,7 +28,7 @@ import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
@@ -40,6 +48,13 @@ from .barrier_store import (
     ReplacementInRoster,
 )
 from .config import load_settings
+from .handoff_store import (
+    BarrierNotReached,
+    HandoffBarrierNotFound,
+    HandoffConflict,
+    HandoffNotFound,
+    HandoffStore,
+)
 from .models import (
     BarrierEventsPage,
     BarrierView,
@@ -52,11 +67,23 @@ from .models import (
     CheckinRequest,
     CheckinResponse,
     CreateBarrierRequest,
+    CreateHandoffRequest,
+    CreateHandoffResponse,
     ExtendDeadlineRequest,
+    HandoffClaimRequest,
+    HandoffCompleteRequest,
+    HandoffRenewRequest,
+    HandoffView,
     ReplaceRequest,
     ReplaceResponse,
 )
-from .service import _dt, build_view, build_view_from_snapshot, wait_for_settle
+from .service import (
+    _dt,
+    build_handoff_view,
+    build_view,
+    build_view_from_snapshot,
+    wait_for_settle,
+)
 
 settings = load_settings()
 
@@ -65,6 +92,7 @@ settings = load_settings()
 async def lifespan(app: FastAPI):
     redis = Redis.from_url(settings.redis_url, decode_responses=True)
     app.state.store = BarrierStore(redis)
+    app.state.handoffs = HandoffStore(redis, lease_ms=settings.handoff_lease_ms)
     yield
     await app.state.store.aclose()
 
@@ -73,15 +101,20 @@ app = FastAPI(
     title="任务收尾屏障 API",
     description=(
         "并行任务协调收尾：创建屏障、幂等报到、批量幂等报到、阻塞等待达标、"
-        "取消或截止、运行中延期与运行中参与者替补。"
+        "取消或截止、运行中延期与运行中参与者替补；达标后可建立带 fence "
+        "令牌租约的结果交接单（认领 / 续租 / 完成，Redis 内原子裁决）。"
     ),
-    version="1.5.0",
+    version="1.6.0",
     lifespan=lifespan,
 )
 
 
 def store(request: Request) -> BarrierStore:
     return request.app.state.store
+
+
+def handoffs(request: Request) -> HandoffStore:
+    return request.app.state.handoffs
 
 
 @app.exception_handler(RedisError)
@@ -107,6 +140,11 @@ async def root() -> dict[str, object]:
             "replace": "POST /barriers/{barrier_id}/replace",
             "wait": "GET /barriers/{barrier_id}/wait",
             "events": "GET /barriers/{barrier_id}/events",
+            "create_handoff": "POST /handoffs",
+            "get_handoff": "GET /handoffs/{handoff_id}",
+            "claim_handoff": "POST /handoffs/{handoff_id}/claim",
+            "renew_handoff": "POST /handoffs/{handoff_id}/renew",
+            "complete_handoff": "POST /handoffs/{handoff_id}/complete",
         },
     }
 
@@ -507,3 +545,162 @@ async def list_events(
         ],
         next_cursor=next_cursor,
     )
+
+
+# ---------------------------------------------------------------------------
+# 达标结果交接 Handoff
+# ---------------------------------------------------------------------------
+
+
+# 凭证 / 租约类冲突统一为 409，按 Lua 原子裁决出的原因给出明确文案。
+_HANDOFF_CONFLICT_DETAIL = {
+    "completed": "交接单已完成，终态永久拒绝再次认领 / 续租 / 完成",
+    "active": "交接单已被认领且租约仍有效，需等待其到期后才能接管",
+    "no_owner": "交接单尚未被认领，没有可续租 / 完成的凭证",
+    "bad_owner": "owner 与当前持有者不符，操作被拒绝",
+    "bad_fence": "fence 不是当前凭证（可能已被到期接管作废），操作被拒绝",
+    "lease_expired": "租约已到期，凭证失效，需重新认领后才能操作",
+}
+
+
+def _handoff_conflict(exc: HandoffConflict) -> HTTPException:
+    reason = exc.args[0] if exc.args else "active"
+    return HTTPException(
+        status_code=409,
+        detail=_HANDOFF_CONFLICT_DETAIL.get(reason, "交接单状态冲突，操作被拒绝"),
+    )
+
+
+@app.post(
+    "/handoffs",
+    response_model=CreateHandoffResponse,
+    status_code=201,
+    tags=["handoffs"],
+)
+async def create_handoff(
+    payload: CreateHandoffRequest, request: Request, response: Response
+) -> CreateHandoffResponse:
+    """为**已达标**屏障建立结果交接单。
+
+    - 仅复制达标冻结快照中的 ``quorum`` 与 ``frozen_at``，屏障之后的任何
+      变化（迟到报到、回收）都不影响交接单；
+    - 同一 ``barrier_id`` 重复创建**幂等返回原单**（200，``replayed=true``），
+      并发创建由 Redis 在同一 Lua 脚本内原子去重，只会建立一单；
+    - 屏障不存在或已过期回收 -> ``404``；屏障仍在 waiting、已取消或已截止
+      而未达标 -> ``409``；
+    - 交接单**独立持久保存且不设 TTL**：屏障键到期回收后交接单仍可查询、
+      认领与完成。
+    """
+    try:
+        record, created = await handoffs(request).create(payload.barrier_id)
+    except HandoffBarrierNotFound:
+        raise HTTPException(status_code=404, detail="屏障不存在或已过期回收")
+    except BarrierNotReached:
+        raise HTTPException(status_code=409, detail="屏障尚未达标，不能建立交接单")
+
+    if not created:
+        # 幂等回放既有交接单：200；首次建立保持声明的 201。
+        response.status_code = 200
+    return build_handoff_view(record).model_copy(update={"replayed": not created})
+
+
+async def _load_handoff(request: Request, handoff_id: str):
+    record = await handoffs(request).get(handoff_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="交接单不存在")
+    return record
+
+
+@app.get(
+    "/handoffs/{handoff_id}",
+    response_model=HandoffView,
+    tags=["handoffs"],
+)
+async def get_handoff(handoff_id: str, request: Request) -> HandoffView:
+    """查询交接单：达标快照（quorum/frozen_at）、状态与当前租约。
+
+    状态以 Redis 时间裁决：``idle``（从未认领）、``active``（租约有效）、
+    ``expired``（租约到期、等待接管）、``completed``（已完成终态）。
+    租约到期后 ``owner`` / ``fence`` / ``lease_expires_at`` 仍展示上一任
+    持有者，但 ``lease_active=false``，其凭证已失效。
+    """
+    record = await _load_handoff(request, handoff_id)
+    return build_handoff_view(record)
+
+
+@app.post(
+    "/handoffs/{handoff_id}/claim",
+    response_model=HandoffView,
+    tags=["handoffs"],
+)
+async def claim_handoff(
+    handoff_id: str, payload: HandoffClaimRequest, request: Request
+) -> HandoffView:
+    """认领交接单，获得执行权与 fence 凭证。
+
+    - 仅当单据**空闲（从未认领）或当前租约已到期**时可认领 / 接管；
+      租约仍有效时（即使是同一 owner 重复认领）返回 ``409``；
+    - 成功返回单调递增的 ``fence``（每次接管在上一任 fence 上 +1）与
+      ``lease_expires_at``（认领时刻 + ``HANDOFF_LEASE_TTL_MS``）；
+    - 到期接管后，旧 owner 手中的旧 fence 立即作废，再续租 / 完成均 ``409``；
+    - 竞争认领完全由 Redis Lua 脚本以 **Redis 时钟**原子裁决，并发请求
+      必有且仅有一个赢家；
+    - 已完成（``completed``）永久拒绝再次认领，返回 ``409``。
+    """
+    try:
+        record = await handoffs(request).claim(handoff_id, payload.owner)
+    except HandoffNotFound:
+        raise HTTPException(status_code=404, detail="交接单不存在")
+    except HandoffConflict as exc:
+        raise _handoff_conflict(exc)
+    return build_handoff_view(record)
+
+
+@app.post(
+    "/handoffs/{handoff_id}/renew",
+    response_model=HandoffView,
+    tags=["handoffs"],
+)
+async def renew_handoff(
+    handoff_id: str, payload: HandoffRenewRequest, request: Request
+) -> HandoffView:
+    """续租：把租约到期点向后顺延一个 ``HANDOFF_LEASE_TTL_MS`` 窗口。
+
+    必须同时携带认领时返回的 ``owner`` 与当前 ``fence``，且租约在裁决时
+    （以 Redis 时间为准）仍有效；owner 不符、fence 已被接管作废、租约已
+    到期或单据已完成均返回 ``409``，到期点不变。
+    """
+    try:
+        record = await handoffs(request).renew(
+            handoff_id, payload.owner, payload.fence
+        )
+    except HandoffNotFound:
+        raise HTTPException(status_code=404, detail="交接单不存在")
+    except HandoffConflict as exc:
+        raise _handoff_conflict(exc)
+    return build_handoff_view(record)
+
+
+@app.post(
+    "/handoffs/{handoff_id}/complete",
+    response_model=HandoffView,
+    tags=["handoffs"],
+)
+async def complete_handoff(
+    handoff_id: str, payload: HandoffCompleteRequest, request: Request
+) -> HandoffView:
+    """完成交接：状态进入 ``completed`` 终态。
+
+    必须携带有效的 ``owner`` + ``fence`` 且租约仍有效（以 Redis 时间裁决）；
+    完成后交接单仍可查询，但**永久拒绝再次认领、续租与重复完成**（均
+    ``409``）。交接单独立持久保存，不会随屏障回收而消失。
+    """
+    try:
+        record = await handoffs(request).complete(
+            handoff_id, payload.owner, payload.fence
+        )
+    except HandoffNotFound:
+        raise HTTPException(status_code=404, detail="交接单不存在")
+    except HandoffConflict as exc:
+        raise _handoff_conflict(exc)
+    return build_handoff_view(record)

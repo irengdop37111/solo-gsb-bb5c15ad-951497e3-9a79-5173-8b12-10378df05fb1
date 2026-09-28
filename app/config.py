@@ -15,6 +15,9 @@ class Settings:
     poll_interval_s: float
     # 单次等待请求的最长挂起时间（秒），防止极端情况下连接被无限占用
     max_wait_s: float
+    # 达标结果交接单的认领租约时长（毫秒）：claim 成功后租约有效窗口，
+    # 窗口内仅持有 owner+fence 可续租 / 完成；窗口到期后任何 owner 可接管
+    handoff_lease_ms: int
 
 
 def load_settings() -> Settings:
@@ -23,4 +26,5 @@ def load_settings() -> Settings:
         ttl_buffer_ms=int(os.environ.get("BARRIER_TTL_BUFFER_MS", str(24 * 3600 * 1000))),
         poll_interval_s=float(os.environ.get("BARRIER_POLL_INTERVAL_S", "1.0")),
         max_wait_s=float(os.environ.get("BARRIER_MAX_WAIT_S", str(3600))),
+        handoff_lease_ms=int(os.environ.get("HANDOFF_LEASE_TTL_MS", "30000")),
     )

@@ -6,7 +6,8 @@ import time
 from datetime import datetime, timezone
 
 from .barrier_store import BarrierMeta, BarrierStore
-from .models import BarrierView, GroupProgress
+from .handoff_store import HandoffRecord
+from .models import BarrierView, GroupProgress, HandoffView
 
 # 不可再变的终态：达标、截止、主动取消
 SETTLED_STATUSES = frozenset({"reached", "expired", "cancelled"})
@@ -14,6 +15,34 @@ SETTLED_STATUSES = frozenset({"reached", "expired", "cancelled"})
 
 def _dt(ts: float) -> datetime:
     return datetime.fromtimestamp(ts, tz=timezone.utc)
+
+
+def build_handoff_view(record: HandoffRecord) -> HandoffView:
+    """把 Redis 交接单记录组装为响应视图。
+
+    交接单内时间戳以毫秒存储（frozen_at 源自屏障冻结快照，Lua 内以 Redis
+    秒级时间写入；created_at / 租约到期点 / completed_at 均为 Redis 毫秒
+    时钟），统一在 API 层换算为带时区的 UTC 时间。
+    """
+    return HandoffView(
+        handoff_id=record.handoff_id,
+        barrier_id=record.barrier_id,
+        status=record.status,
+        quorum=list(record.quorum),
+        frozen_at=_dt(record.frozen_at_ms / 1000.0),
+        created_at=_dt(record.created_at_ms / 1000.0),
+        owner=record.owner,
+        fence=record.fence,
+        lease_expires_at=(
+            _dt(record.expires_ms / 1000.0) if record.expires_ms is not None else None
+        ),
+        lease_active=record.lease_active,
+        completed_at=(
+            _dt(record.completed_at_ms / 1000.0)
+            if record.completed_at_ms is not None
+            else None
+        ),
+    )
 
 
 def _group_progress(

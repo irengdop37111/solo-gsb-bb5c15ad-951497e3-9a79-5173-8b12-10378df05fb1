@@ -2,7 +2,7 @@ services:
   redis:
     image: redis:7-alpine
     # AOF 持久化：屏障元数据、名单（含运行中替补后的名单）、审计事件、
-    # 批量报到幂等记录均落盘。
+    # 批量报到幂等记录以及达标结果交接单（handoff，永久保留、不设 TTL）均落盘。
     # 原子报到 / 批量报到 / 取消 / 延期 / 替补全部在 Redis 单节点的 Lua 脚本内
     # 串行执行，依赖单线程顺序保证并发唯一结果（含跨接口的 quorum 唯一冻结与
     # 同幂等键只执行一次），因此不要在未做脚本兼容前改为分片集群。
@@ -26,6 +26,10 @@ services:
       # deadline_extended/participant_replaced 四种唤醒消息
       BARRIER_POLL_INTERVAL_S: "0.5"
       BARRIER_MAX_WAIT_S: "3600"
+      # 达标结果交接单（POST /handoffs）的认领租约时长（毫秒）：
+      # claim 成功后持有者独占 30s，到期后其他 worker 可接管并令旧 fence 作废；
+      # 交接单本身不设 TTL（独立持久保存），不受屏障回收影响
+      HANDOFF_LEASE_TTL_MS: "30000"
     ports:
       - "8000:8000"
     depends_on:

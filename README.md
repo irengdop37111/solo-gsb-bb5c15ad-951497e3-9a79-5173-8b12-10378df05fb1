@@ -10,7 +10,8 @@
 - 支持**主动取消**：取消与达标报到在 Redis 中**原子竞争**，先发生者成为唯一终态（`cancelled` 与 `reached` 互斥）；取消保存 `reason` / `cancelled_at` 并唤醒全部等待者；
 - 支持**运行中延期**：`PATCH /barriers/{id}/deadline` 传入新的**绝对截止时间**，仅当屏障仍处于 `waiting` 且新时间**严格晚于**当前 deadline 时，在一段 Redis Lua 脚本内原子完成状态校验、deadline 写回与**全部相关键存活期刷新**；终态（reached/cancelled/expired）绝不复活；并发延期、报到与取消保持唯一一致结果；延期成功立即通知已挂起的 `/wait` **按最新 deadline 继续等待**，不会按旧截止时间误报 `expired`；
 - 支持**运行中参与者替补**：`POST /barriers/{id}/replace` 在原参与者**尚未报到**且屏障仍 `waiting` 时，把其**原子地替换为名单外的新标识**并**继承原分组**；替补与报到、取消、延期及其他替补并发时按 Redis 实际生效顺序**唯一生效**，并记录可分页查询的 `replaced` 审计事件、唤醒 `/wait`；达标、取消或截止后一律拒绝替补；
-- 提供**阻塞等待接口**：达标 / 取消时立即返回终态快照；截止时返回已报到成员与缺席名单；多个等待者通过 Redis Pub/Sub 一并被可靠唤醒（轮询兜底，消息丢失也不会睡死）。
+- 提供**阻塞等待接口**：达标 / 取消时立即返回终态快照；截止时返回已报到成员与缺席名单；多个等待者通过 Redis Pub/Sub 一并被可靠唤醒（轮询兜底，消息丢失也不会睡死）；
+- 提供**达标结果交接（handoff）**：`POST /handoffs` 仅为**已达标**屏障建立交接单并复制 `quorum` / `frozen_at`（不存在 `404`、未达标 `409`、同一屏障重复创建幂等返回原单）；交接单带 **fence 令牌租约**——空闲或租约到期才可 `claim`，返回单调递增的 `fence` 与到期时间，`renew` / `complete` 必须携带有效的 `owner` + `fence` 且租约仍有效，到期接管后旧凭证立即作废，完成后永久拒绝再次认领；竞争认领、到期接管与旧凭证拒绝全部在 **Redis Lua 脚本内以 Redis 时间原子裁决**；交接单**独立持久保存且不设 TTL，屏障回收不影响它**。
 
 ## 一条命令启动（含 Redis）
 
@@ -41,6 +42,7 @@ Redis 仅在内网暴露：服务名 `redis`，端口 `6379`，不发布到宿�
 | `BARRIER_TTL_BUFFER_MS` | `86400000`（24h） | 屏障键在截止时间之后额外保留多久，之后由 Redis 自动回收 |
 | `BARRIER_POLL_INTERVAL_S` | `0.5` | 等待接口的轮询兜底间隔（秒），Pub/Sub 为主唤醒通道 |
 | `BARRIER_MAX_WAIT_S` | `3600` | 单次等待请求最长挂起时间（秒） |
+| `HANDOFF_LEASE_TTL_MS` | `30000`（30 秒） | 交接单认领租约时长（毫秒）：claim 成功后租约有效窗口；到期后其他 owner 可接管，旧 fence 作废 |
 
 宿主机端口可在 `docker-compose.yml` 的 `api.ports` 修改（如 `"9000:8000"`）。
 
@@ -383,6 +385,113 @@ curl -s 'http://localhost:8000/barriers/<id>/events?cursor=0&limit=100'
 - 事件只增不改、`seq` 连续递增（报到与替补共用同一序号序列），游标分页在并发写入下稳定、不重不漏；
 - 事件与屏障其他数据同生命周期：回收前可查询，回收后一并消失（`404`）。
 
+### 10. 达标结果交接（Handoff）
+
+屏障达标后，可用交接单把达标结果（`quorum` / `frozen_at`）安全交给某个 worker 执行收尾工作。交接单与屏障键空间分离、**永久保存（不设 TTL）**：即使屏障在截止时间后被 Redis 回收，交接单仍可查询、认领与完成。
+
+#### 建立交接单 `POST /handoffs`
+
+请求体只携带 `barrier_id`，且该屏障必须已经 `reached`：
+
+```bash
+curl -s -X POST http://localhost:8000/handoffs \
+  -H 'Content-Type: application/json' \
+  -d '{"barrier_id":"8f3c…"}'
+```
+
+首次建立返回 `201`：
+
+```json
+{
+  "handoff_id": "a71e…",
+  "barrier_id": "8f3c…",
+  "status": "idle",
+  "quorum": ["node-a", "node-b"],
+  "frozen_at": "2026-09-21T15:00:00.123000Z",
+  "created_at": "2026-09-21T15:00:05.000000Z",
+  "owner": null,
+  "fence": null,
+  "lease_expires_at": null,
+  "lease_active": false,
+  "completed_at": null,
+  "replayed": false
+}
+```
+
+- 复制的是达标冻结瞬间的 `quorum` 与 `frozen_at`：之后的迟到报到、屏障回收都**不会改写**交接单快照；
+- 屏障不存在 / 已过期回收 -> `404`；屏障仍在 `waiting`、已 `cancelled` 或已 `expired` 而未达标 -> `409`；
+- **同一 `barrier_id` 重复创建幂等返回原单**：HTTP `200` 且 `replayed=true`，`handoff_id` 与首次完全相同；并发重复创建由 Redis 在同一 Lua 脚本内原子去重，全局只会建立一单。
+
+#### 查询交接单 `GET /handoffs/{handoff_id}`
+
+返回达标快照、状态与当前租约。`status` 取值（均以 **Redis 时间**裁决）：
+
+| status | 含义 |
+| --- | --- |
+| `idle` | 交接单已建立，从未被认领 |
+| `active` | 已被认领且当前租约有效，`owner` / `fence` / `lease_expires_at` 有效 |
+| `expired` | 租约已到期、等待接管；上一任 `owner` / `fence` 仍展示但 `lease_active=false`，凭证已失效 |
+| `completed` | 已完成终态，永久拒绝再次认领 |
+
+交接单不存在 -> `404`。
+
+#### 认领 / 接管 `POST /handoffs/{handoff_id}/claim`
+
+请求体携带 `owner`（worker 标识，空白会被去除）。**仅当单据空闲或租约已到期时**可认领：
+
+```bash
+curl -s -X POST http://localhost:8000/handoffs/<hid>/claim \
+  -H 'Content-Type: application/json' -d '{"owner":"worker-7"}'
+```
+
+成功返回（`200`）最新交接单视图，关键字段：
+
+```json
+{
+  "status": "active",
+  "owner": "worker-7",
+  "fence": 1,
+  "lease_expires_at": "2026-09-21T15:00:35.123000Z",
+  "lease_active": true
+}
+```
+
+- `fence` **单调递增**：首次认领为 `1`；每次到期接管在上一任 fence 上 `+1`（2、3、…）；
+- `lease_expires_at` = Redis 裁决认领成功的时刻 + `HANDOFF_LEASE_TTL_MS`（默认 30 秒）；
+- 租约仍有效时（**即使是同一 owner 重复认领**）-> `409`；并发竞争认领在 Redis 内原子裁决，**必有且仅有一个赢家**；
+- 租约到期后新 owner 接管成功，旧 owner 手中的旧 fence 立即作废；
+- 已 `completed` 的交接单永久拒绝认领 -> `409`。
+
+#### 续租 `POST /handoffs/{handoff_id}/renew`
+
+必须同时携带 `owner` 与当前 `fence`，且租约在裁决时仍有效；成功后到期点向后顺延一个租约窗口（`fence` 不变）：
+
+```bash
+curl -s -X POST http://localhost:8000/handoffs/<hid>/renew \
+  -H 'Content-Type: application/json' \
+  -d '{"owner":"worker-7","fence":1}'
+```
+
+以下情况一律 `409` 且到期点不变：`owner` 与当前持有者不符、`fence` 不是当前凭证（已被接管作废）、租约已到期、单据已完成；从未认领时续租也是 `409`。
+
+#### 完成 `POST /handoffs/{handoff_id}/complete`
+
+携带有效的 `owner` + `fence` 且租约仍有效时，状态进入 `completed` 终态并记录 `completed_at`：
+
+```bash
+curl -s -X POST http://localhost:8000/handoffs/<hid>/complete \
+  -H 'Content-Type: application/json' \
+  -d '{"owner":"worker-7","fence":1}'
+```
+
+完成后交接单仍可 `GET` 查询（快照、最终持有者与完成时间均保留），但**永久拒绝再次认领、续租与重复完成**（均 `409`）——即使距完成时刻租约本应仍有效，或等待租约到期后也一样拒绝。
+
+#### 交接单的原子性与时间基准
+
+- 创建（屏障存在性 / 达标快照 / 同屏障去重）、claim（空闲或到期判定 + fence 递增 + 到期点写回）、renew / complete（owner + fence + 租约有效期三重校验）分别在一段 Redis Lua 脚本内**整体原子执行**；竞争认领、到期接管与旧凭证拒绝因此只有唯一一致结果，不依赖应用侧加锁。
+- 每段脚本都用 Redis 的 `TIME` 命令取 Redis 自身毫秒时间作为唯一时钟：应用服务器之间的时钟偏差、客户端伪造时间都不会影响租约裁决。
+- 交接单物理键为 `handoff:{hid}`（hash，无 TTL）与 `handoff:bybarrier:{barrier_id}`（去重索引，无 TTL），与 `barrier:*` 键空间完全独立；AOF 开启时随 Redis 持久化。
+
 ## 并发与一致性保证
 
 - 报到判定由一段 Lua 脚本完成：`名单校验 → 终态校验（frozen/cancel/截止）→ 去重 SADD（新成员才同步 HINCRBY 对应分组计数）→ 人数与分组配额判定 → 写入冻结快照（quorum + 分组计数）` 整体原子执行；取消由另一段 Lua 脚本完成：`终态校验（cancel/frozen/截止）→ 写入取消快照` 整体原子执行。Redis 单线程串行执行脚本，因此达标与取消**必有且仅有一个赢家**：并发报到（包括不同分组的成员同时补齐各自短板）只有一个请求得到 `reached`，或者取消请求得到 `cancelled`，互斥终态的成员集合、时间点、分组计数、取消原因均唯一确定。
@@ -394,6 +503,7 @@ curl -s 'http://localhost:8000/barriers/<id>/events?cursor=0&limit=100'
 - 终态落地后脚本的所有写路径都不会触碰对方的终态键：迟到报到只追加到 `checked` 集合（反映在 `late` 字段）；取消后的报到不写任何键；已达标 / 已截止后的取消直接返回冲突；已达标 / 已取消 / 已截止后的延期与替补直接返回冲突。
 - 报到响应里的 `PUBLISH reached`、取消响应里的 `PUBLISH cancelled`、延期响应里的 `PUBLISH deadline_extended` 与替补响应里的 `PUBLISH participant_replaced` 都在脚本执行成功之后进行；即使发布失败，等待者每 `BARRIER_POLL_INTERVAL_S` 秒回读一次真实状态（含 meta 中可能已被延期的最新 deadline，以及 roster / gmap 中可能已被替补改写的名单与分组）。
 - 自然截止不发布消息（无后台扫描进程），等待者在剩余截止时间上自然到期回读；该剩余时间每轮都按回读到的最新 deadline 重算，因此延期后旧截止点不会产生误报，避免引入额外调度组件。
+- **达标结果交接的 fence 租约由独立的 Redis Lua 脚本组裁决**：创建脚本在同一原子操作内完成「屏障 meta 存在性检查 → 同屏障去重索引检查 → frozen 快照读取 → 交接单与索引写入」，并发重复创建只有一单；认领脚本在同一原子操作内完成「completed 终态检查 → 以 Redis TIME 判定空闲 / 到期 → fence 单调 +1 → 写 owner / fence / 到期点」，竞争认领与到期接管必有唯一赢家；续租 / 完成脚本在同一原子操作内完成「owner 相等 → fence 相等 → 租约未到期（完成脚本还校验终态）」三重校验，到期接管后旧 owner 的旧 fence 立即无法续租或完成；完成脚本写入的 `completed` 是终态，任何脚本路径都不再允许认领。全部脚本统一调用 Redis `TIME` 取毫秒时间，租约裁决与应用进程时钟完全解耦。交接单键不设 TTL，与屏障数据各自独立持久化，屏障回收不影响交接单。
 
 ## 本地不使用容器开发
 
@@ -411,9 +521,10 @@ REDIS_URL=redis://localhost:6379/0 uvicorn app.main:app --reload --port 8000
 app/
   main.py           FastAPI 路由与错误映射
   barrier_store.py  Redis 键模型 + 原子报到/批量报到/取消/延期/替补 Lua 脚本（分组配额计数、审计事件、批量幂等记录、TTL 顺延）+ Pub/Sub
-  service.py        状态机视图组装、批量首次结果快照回放、阻塞等待（按最新 deadline / 替换后名单回读）
+  handoff_store.py  达标结果交接单 Redis 键模型 + 创建/认领/续租/完成/查询 Lua 脚本（fence 单调递增、租约 Redis 时间原子裁决、无 TTL 独立持久化）
+  service.py        状态机视图组装、批量首次结果快照回放、阻塞等待（按最新 deadline / 替换后名单回读）、交接单视图组装
   models.py         请求/响应模型与校验
-  config.py         环境变量配置
+  config.py         环境变量配置（含 HANDOFF_LEASE_TTL_MS，默认 30000ms）
 Dockerfile          API 镜像
 docker-compose.yml  api + redis（健康检查、依赖顺序、数据卷）
 ```
